@@ -1,0 +1,163 @@
+/**
+ * @file App-wide constants for Pocket CEP.
+ *
+ * Centralizes magic strings and configuration values so they can be
+ * referenced consistently across server code, client components, and
+ * diagnostic scripts.
+ */
+
+/**
+ * Email domain for anonymous sessions in service_account mode.
+ * BetterAuth's anonymous plugin generates emails like `anon-xyz@{domain}`.
+ * The UI checks for this domain to display "Service Account" instead
+ * of the generated email address.
+ */
+export const SA_EMAIL_DOMAIN = "service-account.local";
+
+/**
+ * Regex pattern for validating Google Workspace Customer IDs.
+ * Must start with 'C' followed by alphanumeric characters (e.g. C01234567).
+ */
+export const CUSTOMER_ID_REGEX = /^C[a-zA-Z0-9]+$/;
+
+/**
+ * DOM id for the header's user-search input. Referenced from the app
+ * bar (focus button), dashboard (`/` keyboard shortcut), and the
+ * selector itself. Centralising the string keeps the three callers in
+ * lockstep when the markup moves.
+ */
+export const USER_SEARCH_INPUT_ID = "user-search";
+
+/**
+ * localStorage key for the sidebar's collapsed state. Persists across
+ * reloads so the layout matches the user's last preference.
+ */
+export const SIDEBAR_COLLAPSED_KEY = "cep_sidebar_collapsed";
+
+/**
+ * Structured log prefixes for each subsystem. These make it easy to
+ * filter server logs by component (e.g. `grep "\[mcp\]"`).
+ */
+export const LOG_TAGS = {
+  MCP: "[mcp]",
+  CHAT: "[chat]",
+  AUTH: "[auth]",
+  USERS: "[users]",
+  ENV: "[env]",
+} as const;
+
+/**
+ * Prefix used for conversational queries auto-populated from dashboard widget actions.
+ * ChatInput detects this prefix to automatically focus the textarea.
+ */
+export const DASHBOARD_QUERY_PREFIX = "The PocketCEP dashboard shows:" as const;
+
+/**
+ * Prevents runaway tool-calling loops where the LLM keeps requesting
+ * tools without producing a final answer. 10 iterations allows complex
+ * multi-step investigations while bounding cost and latency.
+ */
+export const MAX_AGENT_ITERATIONS = 10;
+
+/**
+ * Default MCP server URL used when the user chose the managed flow
+ * (Pocket CEP launches the server itself via `npm run dev:full`).
+ * Mirrored as the Zod default in `env.ts`; exported here so the setup
+ * CLI and doctor can recognise the managed-vs-custom split.
+ */
+export const DEFAULT_MCP_URL = "http://localhost:4000/mcp";
+
+/**
+ * The npx package name `npm run dev:full` uses to launch the upstream
+ * MCP server. The doctor reuses this when auto-starting the server
+ * for a managed-flow probe so a single source of truth exists.
+ *
+ * No version specifier — npx resolves to the registry's `latest`
+ * dist-tag on each invocation. Combined with the `--prefer-online`
+ * flag the spawn sites pass, that means each run picks up the
+ * registry's current `latest` even if a stale version sits in the
+ * local npx cache.
+ */
+export const MCP_NPX_PACKAGE = "@google/chrome-enterprise-premium-mcp";
+
+/**
+ * Flags both `npm run dev:full` and `npm run doctor` pass to `npx`
+ * when launching the managed MCP server. Centralised so the two call
+ * sites can't drift, and so the README can reference a single
+ * canonical command.
+ *
+ * - `-y` — auto-confirm the install prompt the first time npx fetches
+ *   the package. Without it, a fresh checkout hangs at "Ok to proceed?"
+ *   waiting on stdin that the spawned child never receives.
+ * - `--prefer-online` — make npx revalidate against the registry on
+ *   every run instead of reusing a cached copy. Combined with the
+ *   unpinned package name above, that means each run picks up the
+ *   registry's current `latest`.
+ * - `--registry=https://registry.npmjs.org/` — pin the public npm
+ *   registry. Some corporate machines default to an Artifact Registry
+ *   mirror that 404s on `/advisories/bulk`, which makes npm spend
+ *   minutes retrying audit calls and dumping `silly audit` log lines
+ *   before giving up. Pinning the public registry sidesteps that.
+ */
+export const MCP_NPX_ARGS = [
+  "-y",
+  "--prefer-online",
+  "--registry=https://registry.npmjs.org/",
+] as const;
+
+/**
+ * Convenience: the full `npx ...` shell command Pocket CEP uses to
+ * launch the managed MCP server. Used by `dev-full.ts` and by
+ * user-facing copy that needs to print the literal command.
+ */
+export const MCP_NPX_COMMAND = `npx ${MCP_NPX_ARGS.join(" ")} ${MCP_NPX_PACKAGE}`;
+
+/**
+ * Canonical Google Admin Console URLs for resolving security posture gaps.
+ */
+export const ADMIN_CONSOLE_URLS = {
+  SUBSCRIPTIONS: "https://admin.google.com/ac/billing/subscriptions",
+  USERS: "https://admin.google.com/ac/users",
+  DLP_RULES: "https://admin.google.com/ac/dp/rules",
+  CHROME_APPS: "https://admin.google.com/ac/chrome/apps/user",
+  CHROME_SETTINGS: "https://admin.google.com/ac/chrome/settings/user",
+} as const;
+
+/**
+ * Builds the system prompt injected into every LLM conversation.
+ */
+export function buildSystemPrompt(customerId?: string): string {
+  const tenantContext = customerId
+    ? `\nYou are operating against Google Workspace / Chrome Enterprise customer ID "${customerId}". Always pass customerId="${customerId}" when invoking tools that require or accept a customer ID.\n`
+    : "";
+
+  return `You are a Chrome Enterprise Premium admin assistant.
+${tenantContext}
+You have access to MCP tools from the Chrome Enterprise Premium server. Use them to:
+- Check the user's recent Chrome activity (login events, policy violations, downloads)
+- Verify their CEP license status
+- Inspect DLP rules that may affect them
+- Diagnose the environment health
+
+Tool-use rules:
+- get_chrome_activity_log: do NOT set \`eventName\`. The Admin Reports API only
+  accepts a small, undocumented set of event names and invented values
+  return a 400 error. Fetch unfiltered activity and group/summarize in
+  your response instead. For DLP-related questions specifically, the
+  Chrome audit log returns policy-violation events as part of the full
+  stream, so unfiltered fetches include them.
+- For DLP rule configuration (not events), call list_dlp_rules.
+- If a tool returns isError: true, report the error in plain language
+  rather than retrying with a guessed argument.
+
+Interpretation Guidelines:
+- Chrome activity logs contain events named "DLP_RULE_VIOLATION" where the parameter "ACTION" is "AUDIT" or "REPORT". These represent silent monitoring (auditing) of data transfers allowed by policy, NOT active policy breaches, blocks, or warnings.
+- The dashboard widget displays "No Security Blocks or Warnings" when there are zero malware blocks, password leaks, or BLOCKED/WARNED DLP actions. This is correct and does NOT contradict the presence of silent AUDITED data transfers in the logs. Explain this distinction to the user if they ask about contradictions.
+
+Provide clear, educational explanations of:
+- What each Chrome Enterprise feature does
+- What the tool results mean in plain language
+- What actions the admin might take to resolve issues
+
+Be concise but thorough. When you find something noteworthy, explain WHY it matters.`;
+}

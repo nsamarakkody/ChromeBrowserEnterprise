@@ -1,0 +1,90 @@
+/**
+ * @file Mints an anonymous BetterAuth session for service_account mode.
+ *
+ * The middleware (src/proxy.ts) redirects sessionless SA-mode requests
+ * here. We POST to BetterAuth's anonymous sign-in endpoint, forward all
+ * Set-Cookie headers, and redirect to the dashboard.
+ *
+ * This creates a "fake" user with a generated email at the
+ * `@service-account.local` domain. The AppBar component detects this
+ * domain to show "Service Account" instead of the generated email.
+ *
+ * The flow is: browser -> middleware (no cookie?) -> GET /auto-session
+ * -> POST /api/auth/sign-in/anonymous -> Set-Cookie -> 302 /dashboard
+ *
+ * Returns 404 in user_oauth mode so this endpoint cannot be abused to
+ * bypass real authentication.
+ */
+
+import { NextResponse } from "next/server";
+import { getEnv } from "@/lib/env";
+import { renderSaSessionErrorHtml } from "@/lib/env-error-page";
+
+/**
+ * Creates an anonymous session and redirects to the dashboard.
+ * Only active in service_account mode; returns 404 otherwise.
+ */
+export async function GET(request: Request) {
+  const config = getEnv();
+
+  if (config.AUTH_MODE !== "service_account") {
+    return new Response("Not found", { status: 404 });
+  }
+
+  /**
+   * Derive base from request.url so port shifts (e.g. Next.js running on
+   * 3001 when 3000 is occupied) fetch the active server instance instead
+   * of timing out against an offline port.
+   */
+  const reqUrl = new URL(request.url);
+  const base = `${reqUrl.protocol}//${reqUrl.host}`;
+
+  const acceptJson = request.headers.get("accept")?.includes("application/json");
+
+  let response: Response;
+  try {
+    response = await fetch(`${base}/api/auth/sign-in/anonymous`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    if (acceptJson) {
+      return NextResponse.json({ error: "session_unavailable" }, { status: 503 });
+    }
+    const errMsg = err instanceof Error ? err.message : String(err);
+    return new NextResponse(renderSaSessionErrorHtml(`Fetch failed: ${errMsg}`), {
+      status: 503,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
+
+  if (!response.ok) {
+    if (acceptJson) {
+      return NextResponse.json({ error: "session_failed" }, { status: 401 });
+    }
+    const body = await response.text().catch(() => "Unknown error");
+    return new NextResponse(renderSaSessionErrorHtml(`API returned ${response.status}: ${body}`), {
+      status: response.status,
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
+
+  const cookies = response.headers.getSetCookie();
+
+  if (acceptJson) {
+    const headers = new Headers();
+    for (const cookie of cookies) {
+      headers.append("Set-Cookie", cookie);
+    }
+    return NextResponse.json({ success: true }, { headers });
+  }
+
+  const headers = new Headers({ Location: new URL("/dashboard", base).toString() });
+  for (const cookie of cookies) {
+    headers.append("Set-Cookie", cookie);
+  }
+
+  return new Response(null, { status: 302, headers });
+}
